@@ -17,9 +17,10 @@ plus a non-negative offset.  The engine
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 class EngineError(Exception):
@@ -90,7 +91,7 @@ def validate(items: Iterable[Item]) -> None:
     starts_at: Dict[Tuple[str, int], set] = {}
     for it in items:
         key = (it.fixture, it.channel)
-        s = starts[it]
+        s = starts[it.id]
         bucket = starts_at.setdefault(key, set())
         if s in bucket:
             raise EngineError(
@@ -133,28 +134,82 @@ def _check_cycles(items: List[Item], by_id: Dict[int, Item]) -> None:
                 stack.pop()
 
 
+def dependency_order(
+    by_id: Dict[int, Item], roots: Optional[Iterable[int]] = None
+) -> List[int]:
+    """Return reference ancestors before their dependents (iterative).
+
+    An item referencing another is ordered *after* that referenced item,
+    so walking the result guarantees every ``ref_id`` has already been
+    handled — the same order drives time resolution and the ancestor-first
+    writes of cross-project porting.  Ties break by id for deterministic
+    output.  Callers must already have ruled out missing references and
+    cycles; when ``roots`` is given, only their transitive closure is
+    returned.
+
+    The traversal is explicit (a Kahn-style heap over indegrees), so legal
+    chains of any length work regardless of Python's recursion limit —
+    earlier ids are free to depend on later ids.
+    """
+    if roots is None:
+        node_ids: Set[int] = set(by_id)
+    else:
+        node_ids = set()
+        stack = list(roots)
+        while stack:
+            cur = stack.pop()
+            if cur in node_ids:
+                continue
+            node_ids.add(cur)
+            ref = by_id[cur].ref_id
+            if by_id[cur].start_mode == "ref" and ref in by_id:
+                stack.append(ref)
+
+    indegree: Dict[int, int] = {}
+    dependents: Dict[int, List[int]] = {}
+    for i in node_ids:
+        ref = by_id[i].ref_id
+        if by_id[i].start_mode == "ref" and ref in node_ids:
+            indegree[i] = indegree.get(i, 0) + 1
+            dependents.setdefault(ref, []).append(i)
+        else:
+            indegree.setdefault(i, 0)
+
+    heap: List[int] = [i for i, d in indegree.items() if d == 0]
+    heapq.heapify(heap)
+    order: List[int] = []
+    while heap:
+        cur = heapq.heappop(heap)
+        order.append(cur)
+        for nxt in dependents.get(cur, ()):
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                heapq.heappush(heap, nxt)
+    return order
+
+
 def resolve_starts(
     items: List[Item], by_id: Dict[int, Item]
-) -> Dict[Item, int]:
-    memo: Dict[int, int] = {}
+) -> Dict[int, int]:
+    """Resolve every item id to its absolute start time, iteratively.
 
-    def start_of(x: Item) -> int:
-        if x.id is not None and x.id in memo:
-            return memo[x.id]
+    Walked in the shared :func:`dependency_order` (ancestors first), so an
+    item's referenced start/end is already known regardless of whether it
+    points at a smaller or a larger id; no Python call stack grows with
+    the chain length.
+    """
+    starts: Dict[int, int] = {}
+    for x_id in dependency_order(by_id):
+        x = by_id[x_id]
         if x.start_mode == "abs":
             value = x.start_ms or 0
         else:
-            ref = by_id[x.ref_id]
-            base = start_of(ref) if x.ref_edge == "start" else end_of(ref)
+            ref_start = starts[x.ref_id]
+            base = ref_start if x.ref_edge == "start" \
+                else ref_start + by_id[x.ref_id].duration
             value = base + (x.ref_offset or 0)
-        if x.id is not None:
-            memo[x.id] = value
-        return value
-
-    def end_of(x: Item) -> int:
-        return start_of(x) + x.duration
-
-    return {it: start_of(it) for it in items}
+        starts[x_id] = value
+    return starts
 
 
 # --------------------------------------------------------------------------
@@ -167,20 +222,18 @@ def resolve(items: Iterable[Item]) -> ResolvedView:
     by_id = {it.id: it for it in items}
     starts = resolve_starts(items, by_id)
 
-    ordered = sorted(items, key=lambda it: (starts[it], it.id))
-    resolved: Dict[int, ResolvedItem] = {}
-
     grouped: Dict[Tuple[str, int], List[Item]] = {}
-    for it in ordered:
+    for it in items:
         grouped.setdefault((it.fixture, it.channel), []).append(it)
 
+    resolved: Dict[int, ResolvedItem] = {}
     lanes: Dict[str, List[Segment]] = {}
     for (fixture, channel), lane_items in grouped.items():
-        lane_items.sort(key=lambda it: (starts[it], it.id))
+        lane_items.sort(key=lambda it: (starts[it.id], it.id))
         segs: List[Segment] = []
         value = Fraction(0)  # current unrounded channel value
-        for it in lane_items:
-            s = starts[it]
+        for pos, it in enumerate(lane_items):
+            s = starts[it.id]
             e = s + it.duration
             # value of the prior fade at time s (the fade may be cut short)
             value = _value_at(segs, s, value)
@@ -192,8 +245,9 @@ def resolve(items: Iterable[Item]) -> ResolvedView:
             else:
                 segs.append(Segment(s, e, value, target, False, it.id))
                 value = target
-                nxt = next((j for j in lane_items if starts[j] > s), None)
-                interrupted_by = nxt.id if nxt is not None and starts[nxt] < e else None
+                nxt = lane_items[pos + 1] if pos + 1 < len(lane_items) else None
+                interrupted_by = nxt.id if nxt is not None and starts[nxt.id] < e \
+                    else None
             resolved[it.id] = ResolvedItem(it, s, e, interrupted_by)
         lanes[f"{fixture}|{channel}"] = segs
 
@@ -326,32 +380,22 @@ def port_fragment(
 
     # actual starts come from resolving the source project's references
     starts = resolve_starts(items, by_id)
-    earliest = min(starts[by_id[i]] for i in closure)
+    earliest = min(starts[i] for i in closure)
     shift = landing_ms - earliest  # every actual start moves by this delta
 
     # ancestors first, so a reference is always rewired to an ancestor
-    # whose new id is already allocated; deterministic for a given source
-    order: List[int] = []
-    seen = set()
-
-    def visit(i: int) -> None:
-        if i in seen:
-            return
-        seen.add(i)
-        it = by_id[i]
-        if it.start_mode == "ref" and it.ref_id in closure:
-            visit(it.ref_id)
-        order.append(i)
-
-    for i in sorted(closure):
-        visit(i)
+    # whose new id is already allocated; the same iterative dependency
+    # order used for resolving times (id order breaks ties, so a legal
+    # chain of any length — including early ids pointing at later ids —
+    # never hits Python's recursion limit).
+    order = dependency_order(by_id, closure)
 
     plan: List[Tuple[int, Item]] = []
     for old_id in order:
         it = by_id[old_id]
         if it.start_mode == "abs":
             moved = Item(None, it.fixture, it.channel, it.target, it.duration,
-                         "abs", start_ms=starts[it] + shift)
+                         "abs", start_ms=starts[it.id] + shift)
         else:
             moved = Item(None, it.fixture, it.channel, it.target, it.duration,
                          "ref", ref_id=it.ref_id, ref_edge=it.ref_edge,

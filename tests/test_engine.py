@@ -240,6 +240,108 @@ class TestFractionalTimes(unittest.TestCase):
             evaluate(view, Fraction(-1, 2))
 
 
+class TestLongReferenceChains(unittest.TestCase):
+    """Legal chains far longer than Python's recursion limit must resolve.
+
+    The reported build order creates many absolute items first, then edits
+    earlier items one by one to reference a *later* item's end, so the
+    stored graph points from small ids at large ids; both orientations are
+    covered here plus a diamond (a shared ancestor with two long arms).
+    """
+
+    DEPTH = 3000  # well past the default ~1000 frame limit
+
+    def _reversed_chain(self, n):
+        # ids 1..n-1 each reference the next (larger) id's end + 1; n is
+        # the absolute root (starts at 3, lasts 7, so its end is 10)
+        items = [ref_item(i, i + 1, "end", 1, fixture="A", channel=i,
+                          duration=10)
+                 for i in range(1, n)]
+        items.append(abs_item(n, fixture="A", channel=n, duration=7, ms=3))
+        return items
+
+    def test_reversed_long_chain_resolves_without_recursion_error(self):
+        items = self._reversed_chain(self.DEPTH)
+        view = resolve(items)
+        r = {ri.item.id: ri for ri in view.items}
+        # item i starts at (i+1)'s end + 1: each hop down adds 11
+        self.assertEqual(r[self.DEPTH].start, 3)
+        self.assertEqual(r[self.DEPTH].end, 10)
+        self.assertEqual(r[self.DEPTH - 1].start, 11)
+        self.assertEqual(r[1].start, (self.DEPTH - 1) * 11)
+
+    def test_forward_long_chain_resolves(self):
+        n = self.DEPTH
+        items = [abs_item(1, duration=7, ms=3)]
+        for i in range(2, n + 1):
+            items.append(ref_item(i, i - 1, "end", 1, channel=i, duration=10))
+        view = resolve(items)
+        r = {ri.item.id: ri for ri in view.items}
+        self.assertEqual(r[2].start, 11)
+        self.assertEqual(r[n].start, (n - 1) * 11)
+
+    def test_long_chain_start_edges(self):
+        # same shape but referencing the next item's START: every item
+        # collapses onto the root start 3
+        n = 500
+        items = [ref_item(i, i + 1, "start", 0, channel=i)
+                 for i in range(1, n)]
+        items.append(abs_item(n, channel=n, duration=100, ms=3))
+        view = resolve(items)
+        self.assertTrue(all(ri.start == 3 for ri in view.items))
+
+    def test_long_diamond_shared_ancestor(self):
+        # deep left arm 1 -> 2 -> ... -> mid_a -> root, plus a second arm
+        # mid_b -> root: the root is a shared ancestor of both arms, and the
+        # iterative order must visit it exactly once
+        n = self.DEPTH
+        mid_a, mid_b = n - 2, n - 1
+        items = [ref_item(i, i + 1, "end", 0, channel=i)
+                 for i in range(1, mid_a)]  # 1..mid_a-1 -> next id
+        items.append(ref_item(mid_a, n, "end", 0, channel=mid_a))
+        items.append(ref_item(mid_b, n, "start", 5, channel=mid_b))
+        items.append(abs_item(n, channel=n, duration=10, ms=0))
+        view = resolve(items)
+        r = {ri.item.id: ri for ri in view.items}
+        self.assertEqual(r[n].start, 0)
+        self.assertEqual(r[mid_b].start, 5)
+        self.assertEqual(r[mid_a].start, 10)
+        self.assertEqual(r[1].start, 10 + (mid_a - 1) * 1000)
+
+    def test_long_chain_port_plan_is_ancestor_first(self):
+        n = self.DEPTH
+        items = self._reversed_chain(n)
+        plan = port_fragment(items, [1], 9000)
+        old_ids = [old for old, _ in plan]
+        self.assertEqual(len(old_ids), n)
+        # the absolute root (largest id) is planned first; id 1 last
+        self.assertEqual(old_ids[0], n)
+        self.assertEqual(old_ids[-1], 1)
+        # every reference points at an id already seen earlier in the plan
+        seen = set()
+        for old_id, moved in plan:
+            if moved.start_mode == "ref":
+                self.assertIn(moved.ref_id, seen)
+            seen.add(old_id)
+        # earliest actual start (root at 3) aligns to the landing point
+        self.assertEqual(plan[0][1].start_ms, 9000)
+
+    def test_cycle_inside_long_chain_still_rejected(self):
+        n = self.DEPTH
+        items = self._reversed_chain(n)
+        # close the ends: root now references item 1's start -> long cycle
+        items[-1] = ref_item(n, 1, "start", 0, channel=n)
+        with self.assertRaisesRegex(EngineError, "环"):
+            resolve(items)
+
+    def test_missing_reference_inside_long_chain_still_rejected(self):
+        n = self.DEPTH
+        items = self._reversed_chain(n)
+        items[n // 2 - 1] = ref_item(n // 2, 999999, "end", channel=n // 2)
+        with self.assertRaisesRegex(EngineError, "引用缺失"):
+            resolve(items)
+
+
 class TestReferrerChain(unittest.TestCase):
     def test_closure(self):
         items = [

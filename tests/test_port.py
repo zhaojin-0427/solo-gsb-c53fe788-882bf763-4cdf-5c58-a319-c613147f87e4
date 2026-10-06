@@ -175,6 +175,53 @@ class PortTest(unittest.TestCase):
         self.assertEqual(items[id_map[id_b]]["actual_start"], 115)
         self.assertEqual(items[id_map[id_c]]["actual_start"], 120)
 
+    def test_deep_chain_port_is_ancestor_first_and_evals(self):
+        # a legal chain deeper than Python's recursion limit, pointing from
+        # earlier ids at LATER ids' end (the reported build): planning and
+        # insertion must still be ancestor-first, and the merged target must
+        # validate/evaluate end to end
+        n = 520
+        ids = []
+        for k in range(n):
+            r = self.add(self.src, abs_body(channel=k + 1, duration=10, ms=0))
+            ids.append(r["items"][-1]["id"])
+        for k in range(n - 1):
+            r = self.client.put(
+                f"{self.src_url}/items/{ids[k]}",
+                json=ref_body(ids[k + 1], "end", 0, channel=k + 1,
+                              duration=10))
+            self.assertEqual(r.status_code, 200, r.text)
+
+        before_src = self.get(self.src_url)
+        landing = 1_000_000
+        r = self.port([ids[0]], landing)  # selects the whole upstream chain
+        self.assertEqual(r.status_code, 201, r.text)
+        payload = r.json()
+        id_map = {int(k): v for k, v in payload["port"]["id_map"].items()}
+        self.assertEqual(len(id_map), n)
+        items = {i["id"]: i for i in payload["items"]}
+
+        # the last id is the absolute root; its copy is the first written
+        root_new = id_map[ids[-1]]
+        first_new = id_map[ids[0]]
+        self.assertEqual(items[root_new]["actual_start"], landing)
+        self.assertEqual(items[root_new]["actual_end"], landing + 10)
+        self.assertEqual(items[first_new]["actual_start"],
+                         landing + (n - 1) * 10)
+        # every reference is rewired to an already-allocated new id
+        for old_id, new_id in id_map.items():
+            if items[new_id]["start_mode"] == "ref":
+                old_ref = next(i for i in before_src["items"]
+                               if i["id"] == old_id)["ref_id"]
+                self.assertEqual(items[new_id]["ref_id"], id_map[old_ref])
+        # the target timeline evaluates (pick the root channel at landing)
+        ev = self.client.get(f"{self.dst_url}/eval",
+                             params={"t": landing + 5}).json()
+        root_ch = next(c for c in ev["channels"] if c["channel"] == n)
+        self.assertEqual(root_ch["active_item_id"], root_new)
+        # source stays byte-for-byte untouched
+        self.assertEqual(self.get(self.src_url), before_src)
+
     # ------------------------------------------------------------------
     # rejections: both projects stay exactly as they were
     # ------------------------------------------------------------------

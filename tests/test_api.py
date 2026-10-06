@@ -227,6 +227,97 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(ch["value"], direct["value"], text)
             self.assertEqual(ch["active_item_id"], direct["active_item_id"], text)
 
+    def test_long_reversed_chain_saves_shows_and_evaluates(self):
+        # the reported build: many absolute items first, then the earlier
+        # items are rewritten one by one to reference a LATER item's end;
+        # a distinct channel per item keeps every provisional state valid
+        n = 600
+        ids = []
+        for k in range(n):
+            r = self.client.post(
+                f"{self.base}/items",
+                json=abs_body(channel=k + 1, target=(k * 7) % 256,
+                              duration=10, ms=0))
+            self.assertEqual(r.status_code, 201, r.text)
+            ids.append(r.json()["items"][-1]["id"])
+        for k in range(n - 1):
+            r = self.client.put(
+                f"{self.base}/items/{ids[k]}",
+                json=ref_body(ids[k + 1], "end", 0, channel=k + 1,
+                              target=(k * 7) % 256, duration=10))
+            self.assertEqual(r.status_code, 200, r.text)
+
+        # detail resolves the whole chain without a recursion error
+        detail = self.client.get(self.base)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        by_id = {i["id"]: i for i in detail.json()["items"]}
+        root = by_id[ids[-1]]
+        first = by_id[ids[0]]
+        self.assertEqual((root["actual_start"], root["actual_end"]), (0, 10))
+        self.assertEqual(first["actual_start"], (n - 1) * 10)
+        self.assertEqual(first["actual_end"], (n - 1) * 10 + 10)
+
+        # eval on a middle channel: at its start the channel is still 0
+        # and snaps toward the item's target during the 10ms fade
+        mid = by_id[ids[n // 2]]
+        t_start = mid["actual_start"]
+        at = self.client.get(f"{self.base}/eval",
+                             params={"t": t_start}).json()
+        ch = next(c for c in at["channels"] if c["channel"] == n // 2 + 1)
+        self.assertEqual(ch["raw"], "0")
+        after = self.client.get(f"{self.base}/eval",
+                                params={"t": t_start + 5}).json()
+        ch5 = next(c for c in after["channels"]
+                   if c["channel"] == n // 2 + 1)
+        self.assertEqual(Fraction(ch5["raw"]),
+                         Fraction(mid["target"], 2))
+
+    def test_long_chain_cycle_rejected_and_rolled_back(self):
+        n = 600
+        ids = []
+        for k in range(n):
+            r = self.client.post(
+                f"{self.base}/items",
+                json=abs_body(channel=k + 1, duration=10, ms=0))
+            ids.append(r.json()["items"][-1]["id"])
+        for k in range(n - 1):
+            r = self.client.put(
+                f"{self.base}/items/{ids[k]}",
+                json=ref_body(ids[k + 1], "end", 0, channel=k + 1,
+                              duration=10))
+            self.assertEqual(r.status_code, 200, r.text)
+        before = self.client.get(self.base).json()
+        # close the chain into a very long cycle: root references item 1
+        r = self.client.put(
+            f"{self.base}/items/{ids[-1]}",
+            json=ref_body(ids[0], "start", 0, channel=n, duration=10))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("环", r.json()["detail"])
+        after = self.client.get(self.base).json()
+        self.assertEqual(before, after)  # whole project unchanged
+
+    def test_long_chain_missing_reference_rejected_and_rolled_back(self):
+        n = 600
+        ids = []
+        for k in range(n):
+            r = self.client.post(
+                f"{self.base}/items",
+                json=abs_body(channel=k + 1, duration=10, ms=0))
+            ids.append(r.json()["items"][-1]["id"])
+        for k in range(n - 1):
+            r = self.client.put(
+                f"{self.base}/items/{ids[k]}",
+                json=ref_body(ids[k + 1], "end", 0, channel=k + 1,
+                              duration=10))
+            self.assertEqual(r.status_code, 200, r.text)
+        before = self.client.get(self.base).json()
+        r = self.client.put(
+            f"{self.base}/items/{ids[0]}",
+            json=ref_body(999999, "end", 0, channel=1, duration=10))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("引用缺失", r.json()["detail"])
+        self.assertEqual(self.client.get(self.base).json(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
