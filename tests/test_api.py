@@ -29,6 +29,11 @@ class ApiTest(unittest.TestCase):
     def setUpClass(cls):
         db.init_db()
         cls.client = TestClient(app)
+        cls.client.__enter__()  # reuse one portal/event loop for every request
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
 
     def setUp(self):
         # fresh empty project per test
@@ -226,6 +231,128 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(ch["raw"], direct["raw"], text)
             self.assertEqual(ch["value"], direct["value"], text)
             self.assertEqual(ch["active_item_id"], direct["active_item_id"], text)
+
+
+    def test_long_reference_chain_saves_details_evals_and_rejects(self):
+        # A legal chain well past Python's recursion limit (~500 levels) is
+        # built directly in SQLite — this is the "库里已有同类工程" state in
+        # which detail, eval and port used to blow up.  Build order mirrors
+        # the UI repro: all absolute items first, then the earlier items are
+        # changed one by one to reference the LATER item's end + 1ms, so
+        # earlier ids depend on later ids.  Missing refs, cycles and
+        # same-instant clashes stay rejected with the transaction rolled back.
+        n = 520
+
+        def ch(i):
+            return ((i - 1) % 8) + 1
+
+        pid = self.pid
+        with db.transaction() as conn:
+            order = db.next_sort_order(conn, pid)
+            ids = []
+            for i in range(1, n + 1):
+                channel = 512 if i == 1 else ch(i)
+                it = Item(None, "L1", channel, 100, 10, "abs", start_ms=i * 100)
+                ids.append(db.insert_item(conn, pid, it, order))
+                order += 1
+            # rewire earlier ids onto later ids, one by one, no recursion
+            for i in range(1, n):
+                db.update_item(conn, pid, Item(
+                    ids[i - 1], "L1", 512 if i == 1 else ch(i), 100, 10,
+                    "ref", ref_id=ids[i], ref_edge="end", ref_offset=1))
+
+        detail = self.client.get(self.base)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        body = detail.json()
+        self.assertEqual(len(body["items"]), n)
+        by_id = {it["id"]: it for it in body["items"]}
+        head, anchor = by_id[ids[0]], by_id[ids[-1]]
+        self.assertEqual(head["start_mode"], "ref")
+        self.assertEqual(head["ref_id"], ids[1])
+        self.assertEqual(head["ref_edge"], "end")
+        self.assertEqual(anchor["start_mode"], "abs")
+        self.assertEqual(anchor["actual_start"], n * 100)
+        self.assertEqual(head["actual_start"], n * 100 + (n - 1) * 11)
+        # the projects list resolves every project without recursing either
+        lst = self.client.get("/api/projects").json()
+        row = next(p for p in lst if p["id"] == pid)
+        self.assertEqual(row["item_count"], n)
+        self.assertEqual(row["duration"], head["actual_start"] + 10)
+
+        # fractional evaluation of the head item's fade (its own channel 512)
+        mid = head["actual_start"] + 5.5
+        ev = self.client.get(self.base + "/eval", params={"t": str(mid)})
+        self.assertEqual(ev.status_code, 200, ev.text)
+        lane = next(c for c in ev.json()["channels"] if c["channel"] == 512)
+        self.assertEqual(lane["active_item_id"], ids[0])
+        self.assertEqual(lane["raw"], "55")
+
+        # closing the chain into a cycle is rejected AND rolled back
+        r = self.client.put(
+            f"{self.base}/items/{ids[-1]}",
+            json=ref_body(ids[0], "start", offset=0, channel=ch(n),
+                          duration=10))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("环", r.json()["detail"])
+        still = self.client.get(self.base).json()["items"]
+        self.assertEqual(next(i for i in still if i["id"] == ids[-1])
+                         ["start_mode"], "abs")
+
+        # a dangling reference is rejected AND rolled back
+        r = self.client.put(
+            f"{self.base}/items/{ids[0]}",
+            json=ref_body(999999, "start", offset=0, channel=512,
+                          duration=10))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("引用缺失", r.json()["detail"])
+        after = {i["id"]: i for i in self.client.get(self.base).json()["items"]}
+        self.assertEqual(after[ids[0]]["ref_id"], ids[1])
+
+        # a same-instant collision on the head's lane is rejected AND
+        # rolled back, leaving the project otherwise intact
+        other = self.client.post(
+            f"{self.base}/items",
+            json=abs_body(fixture="L1", channel=512, ms=0, duration=10))
+        self.assertEqual(other.status_code, 201, other.text)
+        other_id = other.json()["items"][-1]["id"]
+        r = self.client.put(
+            f"{self.base}/items/{other_id}",
+            json=abs_body(fixture="L1", channel=512,
+                          ms=head["actual_start"], duration=10))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("同时起步", r.json()["detail"])
+        kept = self.client.get(self.base).json()
+        self.assertEqual(len(kept["items"]), n + 1)
+        hit = next(i for i in kept["items"] if i["id"] == other_id)
+        self.assertEqual(hit["actual_start"], 0)
+        # the long chain itself is unchanged
+        self.assertEqual(
+            next(i for i in kept["items"] if i["id"] == ids[0])
+            ["actual_start"], head["actual_start"])
+
+    def test_long_chain_built_incrementally_over_http_saves(self):
+        # the actual interactive repro, one HTTP write per item/edit:
+        # absolute items first, then earlier items rewired onto later ones.
+        # Kept shorter than the SQLite test so the suite stays fast, but it
+        # is still far beyond the old recursion limit (~100 nested frames).
+        n = 160
+        ids = []
+        for i in range(1, n + 1):
+            r = self.client.post(
+                f"{self.base}/items",
+                json=abs_body(channel=((i - 1) % 8) + 1, duration=10,
+                              ms=i * 100))
+            self.assertEqual(r.status_code, 201, r.text)
+            ids.append(r.json()["items"][-1]["id"])
+        for i in range(1, n):
+            r = self.client.put(
+                f"{self.base}/items/{ids[i - 1]}",
+                json=ref_body(ids[i], "end", offset=1,
+                              channel=((i - 1) % 8) + 1, duration=10))
+            self.assertEqual(r.status_code, 200, r.text)
+        head = self.client.get(self.base).json()["items"][0]
+        self.assertEqual(head["ref_edge"], "end")
+        self.assertEqual(head["actual_start"], n * 100 + (n - 1) * 11)
 
 
 if __name__ == "__main__":

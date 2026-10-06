@@ -4,10 +4,12 @@ from fractions import Fraction
 from app.engine import (
     EngineError,
     Item,
+    dependency_order,
     evaluate,
     port_fragment,
     referrer_chain,
     resolve,
+    resolve_starts,
     round_half_up,
 )
 
@@ -251,6 +253,153 @@ class TestReferrerChain(unittest.TestCase):
         ]
         self.assertEqual(sorted(referrer_chain(items, 1)), [2, 3, 4])
         self.assertEqual(referrer_chain(items, 5), [])
+
+
+class TestDependencyOrder(unittest.TestCase):
+    """The shared ancestor-first ordering used by times and port writes."""
+
+    def test_ancestors_first_across_reversed_ids(self):
+        # earlier ids reference later ids: id order cannot walk this DAG
+        items = [
+            ref_item(1, 2, "end"),
+            ref_item(2, 3, "start"),
+            abs_item(3, ms=0),
+        ]
+        by_id = {it.id: it for it in items}
+        self.assertEqual(dependency_order([1], by_id), [3, 2, 1])
+        # all-items roots give the same relative order
+        self.assertEqual(dependency_order([1, 2, 3], by_id), [3, 2, 1])
+
+    def test_dedupes_roots_and_keeps_first_occurrence(self):
+        items = [abs_item(1, ms=0), ref_item(2, 1), ref_item(3, 2)]
+        by_id = {it.id: it for it in items}
+        self.assertEqual(dependency_order([3, 3, 1, 2], by_id), [1, 2, 3])
+
+    def test_diamond_shared_ancestor_emitted_once(self):
+        items = [
+            abs_item(1, ms=0),
+            ref_item(2, 1, channel=2),
+            ref_item(3, 1, channel=3),
+            ref_item(4, 2, channel=4),
+        ]
+        by_id = {it.id: it for it in items}
+        # 4 -> 2 -> 1, then 3 -> (1 already emitted)
+        order = dependency_order([4, 3], by_id)
+        self.assertEqual(order, [1, 2, 4, 3])
+        self.assertEqual(sorted(order), [1, 2, 3, 4])
+
+    def test_missing_reference_raises(self):
+        items = [ref_item(1, 99)]
+        by_id = {it.id: it for it in items}
+        with self.assertRaisesRegex(EngineError, "引用缺失"):
+            dependency_order([1], by_id)
+
+    def test_cycle_raises(self):
+        items = [ref_item(1, 2), ref_item(2, 1)]
+        by_id = {it.id: it for it in items}
+        with self.assertRaisesRegex(EngineError, "环"):
+            dependency_order([1], by_id)
+
+
+class TestLongReferenceChain(unittest.TestCase):
+    """Legal chains far beyond Python's recursion limit must still resolve.
+
+    Build order mirrors the UI repro: many absolute items first, then the
+    earlier items are changed one by one to reference the *later* item's
+    end (earlier ids depend on later ids — the chain is a long path that
+    id order cannot topologically walk).
+    """
+
+    N = 520
+
+    def _chain(self, n=None, edge="end", duration=10, offset=1, rotate=True):
+        n = self.N if n is None else n
+
+        def make(i, mode):
+            ch = ((i - 1) % 8) + 1 if rotate else i
+            if mode == "abs":
+                return abs_item(i, channel=ch, ms=i * 100, duration=duration)
+            return ref_item(i, i + 1, edge, offset, channel=ch, duration=duration)
+
+        return [make(i, "ref" if i < n else "abs") for i in range(1, n + 1)]
+
+    def test_deep_end_chain_resolves_without_recursion_error(self):
+        view = resolve(self._chain())
+        r = {ri.item.id: ri for ri in view.items}
+        # item N is absolute at N*100; each earlier item starts at its
+        # later neighbour's end (duration 10) + offset 1
+        self.assertEqual(r[self.N].start, self.N * 100)
+        expected_head = self.N * 100 + (self.N - 1) * (10 + 1)
+        self.assertEqual(r[1].start, expected_head)
+        self.assertEqual(r[1].end, expected_head + 10)
+        # one more explicit run through the public resolver directly
+        starts = resolve_starts(self._chain(),
+                                {it.id: it for it in self._chain()})
+        self.assertEqual(starts[next(iter(starts))], expected_head)
+
+    def test_deep_chain_evaluates(self):
+        # unique channel per item so the head item's fade really starts at 0
+        view = resolve(self._chain(rotate=False))
+        head = view.items[0]
+        # at the head's own start its fade (channel 1) starts from 0...
+        at = evaluate(view, head.start)["A|1"]
+        self.assertEqual(at["active_item_id"], head.item.id)
+        # ...and reaches its target at its end; fractional playhead works
+        mid = Fraction(head.start) + Fraction(11, 2)  # 5.5ms of the 10ms fade
+        self.assertEqual(evaluate(view, mid)["A|1"]["raw"], "55")
+        self.assertEqual(evaluate(view, head.end)["A|1"]["value"], 100)
+
+    def test_deep_chain_mixed_start_end_edges(self):
+        items = []
+        n = 800
+        for i in range(1, n + 1):
+            ch = ((i - 1) % 8) + 1
+            if i == n:
+                items.append(abs_item(i, channel=ch, ms=0))
+            else:
+                edge = "start" if i % 2 else "end"
+                off = i % 3
+                items.append(ref_item(i, i + 1, edge, off, channel=ch,
+                                      duration=5))
+        # would overflow the call stack under the old recursive resolver
+        view = resolve(items)
+        r = {ri.item.id: ri for ri in view.items}
+        # spot-check the two-step recurrence near the tail
+        self.assertEqual(r[n].start, 0)                       # absolute
+        self.assertEqual(r[n - 1].start, 0 + (n - 1) % 3)    # ref start
+        # n-2 is even -> references n-1's END (start + duration 5)
+        edge_n2 = 5
+        self.assertEqual(r[n - 2].start,
+                         r[n - 1].start + edge_n2 + (n - 2) % 3)
+
+    def test_deep_chain_port_plan_is_ancestor_first_and_aligned(self):
+        items = self._chain()
+        plan = port_fragment(items, [1], 10000)
+        self.assertEqual(len(plan), self.N)
+        pos = {old: k for k, (old, _) in enumerate(plan)}
+        # ancestor (later id) written before each earlier dependent
+        for i in range(1, self.N):
+            self.assertLess(pos[i + 1], pos[i])
+        moved = dict(plan)
+        # earliest resolved start is item N at N*100 -> aligned to landing
+        self.assertEqual(moved[self.N].start_mode, "abs")
+        self.assertEqual(moved[self.N].start_ms, 10000)
+        # reference rows keep start/end edge semantics and offsets; they
+        # still carry old ids (the caller rewires in ancestor-first order)
+        self.assertEqual(moved[1].start_mode, "ref")
+        self.assertEqual(moved[1].ref_id, 2)
+        self.assertEqual(moved[1].ref_edge, "end")
+        self.assertEqual(moved[1].ref_offset, 1)
+        self.assertIsNone(moved[1].id)
+
+    def test_deep_cycle_still_rejected(self):
+        # a long lead-in ending in a 2-node cycle must be reported, not
+        # crash the iterative cycle check or the topological resolver
+        n = 600
+        items = self._chain(n=n)
+        items[-1] = ref_item(n, 1, "start", 0, channel=((n - 1) % 8) + 1)
+        with self.assertRaisesRegex(EngineError, "环"):
+            resolve(items)
 
 
 class TestPortFragment(unittest.TestCase):

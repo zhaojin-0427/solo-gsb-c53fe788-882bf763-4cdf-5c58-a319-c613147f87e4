@@ -1,9 +1,12 @@
-"""Seed a small demo project on first launch (shows references + interruption)."""
+"""Seed demo projects on first launch (references, interruption, and a long
+legal reference chain that used to overflow the engine's recursion)."""
 
 from __future__ import annotations
 
 from . import db
 from .engine import Item
+
+LONG_CHAIN_ITEMS = 520  # deeper than Python's old recursion budget
 
 
 def seed_if_empty() -> int | None:
@@ -38,4 +41,34 @@ def seed_if_empty() -> int | None:
         # an empty second project: a ready-made target for trying the
         # cross-project fragment port without creating one by hand
         db.create_project(conn, "空工程")
+        _seed_long_chain(conn)
         return pid
+
+
+def _seed_long_chain(conn) -> int:
+    """A legal reference chain hundreds of levels long.
+
+    Built exactly like the UI repro: every item is inserted as an absolute
+    cue first, then the earlier items are changed one by one to reference
+    the *later* item's end + 1ms (earlier ids depend on later ids, so id
+    order cannot topologically walk the chain).  Channels rotate so the
+    resolved starts never collide on one lane.
+    """
+    pid = db.create_project(conn, f"长链工程（{LONG_CHAIN_ITEMS}级引用）")
+    order = db.next_sort_order(conn, pid)
+    n = LONG_CHAIN_ITEMS
+    ids = []
+    for i in range(1, n + 1):
+        channel = ((i - 1) % 16) + 1
+        it = Item(id=None, fixture="链灯", channel=channel, target=100,
+                  duration=10, start_mode="abs", start_ms=i * 100)
+        ids.append(db.insert_item(conn, pid, it, order))
+        order += 1
+    # rewire #1 -> #2(end)+1, #2 -> #3(end)+1, ... ; the last stays absolute
+    for i in range(1, n):
+        channel = ((i - 1) % 16) + 1
+        db.update_item(conn, pid, Item(
+            id=ids[i - 1], fixture="链灯", channel=channel, target=100,
+            duration=10, start_mode="ref", ref_id=ids[i],
+            ref_edge="end", ref_offset=1))
+    return pid

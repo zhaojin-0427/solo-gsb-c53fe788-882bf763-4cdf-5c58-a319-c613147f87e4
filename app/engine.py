@@ -133,28 +133,102 @@ def _check_cycles(items: List[Item], by_id: Dict[int, Item]) -> None:
                 stack.pop()
 
 
+def dependency_order(
+    node_ids: Iterable[int], by_id: Dict[int, Item]
+) -> List[int]:
+    """Return the given item ids (plus every item they reference, transitively)
+    in ancestor-first (reference-topological) order: every referenced item is
+    emitted before the item referencing it.
+
+    This is the single dependency ordering shared by start-time resolution
+    and cross-project fragment porting — times are computed in it and ported
+    rows are written in it, so an ancestor's resolved time / freshly
+    allocated id is always available when its dependents need it.
+
+    Roots are visited in the given order, making the result deterministic
+    for a fixed input.  The walk is deliberately iterative: a legal chain
+    may be hundreds of levels long (earlier ids may legitimately reference
+    later ids), and a recursive walk would exhaust Python's recursion
+    limit.  ``validate`` has already rejected missing references and cycles
+    before this runs; the guards here only turn such a graph into an
+    :class:`EngineError` instead of an infinite loop / ``KeyError``.
+    """
+    roots = list(dict.fromkeys(node_ids))  # dedupe, keep first occurrence
+    order: List[int] = []
+    emitted: set = set()
+
+    for root in roots:
+        if root in emitted:
+            continue
+        # each frame: (item id, whether its ancestor has already been entered)
+        stack: List[Tuple[int, bool]] = [(root, False)]
+        gray: set = set()
+        while stack:
+            i, entered = stack[-1]
+            if entered:
+                stack.pop()
+                gray.discard(i)
+                if i not in emitted:
+                    emitted.add(i)
+                    order.append(i)
+                continue
+            it = by_id.get(i)
+            if it is None:
+                raise EngineError(f"提示项 {i} 不存在，引用缺失")
+            stack[-1] = (i, True)
+            gray.add(i)
+            if it.start_mode == "ref":
+                ref = it.ref_id
+                if ref in gray:
+                    chain = [n for n, _ in stack]
+                    if ref in chain:
+                        chain = chain[chain.index(ref):]
+                    path = " -> ".join("#" + str(n) for n in chain + [ref])
+                    raise EngineError(f"引用链存在环：{path}")
+                if ref not in emitted:
+                    if ref not in by_id:
+                        raise EngineError(f"提示项 {ref} 不存在，引用缺失")
+                    stack.append((ref, False))
+    return order
+
+
 def resolve_starts(
     items: List[Item], by_id: Dict[int, Item]
 ) -> Dict[Item, int]:
-    memo: Dict[int, int] = {}
+    """Resolve every item to its absolute start time.
 
-    def start_of(x: Item) -> int:
-        if x.id is not None and x.id in memo:
-            return memo[x.id]
-        if x.start_mode == "abs":
-            value = x.start_ms or 0
+    Items are processed in the iterative :func:`dependency_order`, so a
+    legal reference chain of arbitrary length — including one where earlier
+    ids depend on later ids — is resolved without recursion.  Both start
+    and end references are served from the same already-computed table, so
+    edge/offset arithmetic is identical to the old recursive walk.
+    """
+    starts: Dict[int, int] = {}
+    for i in dependency_order(
+        (it.id for it in items if it.id is not None), by_id
+    ):
+        it = by_id[i]
+        if it.start_mode == "abs":
+            starts[i] = it.start_ms or 0
         else:
-            ref = by_id[x.ref_id]
-            base = start_of(ref) if x.ref_edge == "start" else end_of(ref)
-            value = base + (x.ref_offset or 0)
-        if x.id is not None:
-            memo[x.id] = value
-        return value
+            ref_start = starts[it.ref_id]
+            base = ref_start if it.ref_edge == "start" \
+                else ref_start + by_id[it.ref_id].duration
+            starts[i] = base + (it.ref_offset or 0)
 
-    def end_of(x: Item) -> int:
-        return start_of(x) + x.duration
-
-    return {it: start_of(it) for it in items}
+    resolved: Dict[Item, int] = {}
+    for it in items:
+        if it.id is not None:
+            resolved[it] = starts[it.id]
+        elif it.start_mode == "abs":
+            # anonymous items are never referenced themselves
+            resolved[it] = it.start_ms or 0
+        else:
+            ref_start = starts[it.ref_id]
+            base = ref_start if it.ref_edge == "start" \
+                else ref_start + by_id[it.ref_id].duration
+            resolved[it] = base + (it.ref_offset or 0)
+    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -179,42 +253,41 @@ def resolve(items: Iterable[Item]) -> ResolvedView:
         lane_items.sort(key=lambda it: (starts[it], it.id))
         segs: List[Segment] = []
         value = Fraction(0)  # current unrounded channel value
-        for it in lane_items:
+        for k, it in enumerate(lane_items):
             s = starts[it]
             e = s + it.duration
-            # value of the prior fade at time s (the fade may be cut short)
-            value = _value_at(segs, s, value)
+            # Value of the prior fade at time s.  Segments are appended in
+            # start order and same-(fixture,channel,instant) pairs were
+            # rejected above, so the last segment is the unique one with the
+            # greatest begin < s: sample it directly instead of rescanning
+            # every prior segment (which made long lanes quadratic).
+            if segs:
+                prev = segs[-1]
+                if prev.instant or s >= prev.end:
+                    value = prev.end_value
+                else:
+                    # a non-instant segment has end == begin + duration > begin
+                    frac = Fraction(s - prev.begin, prev.end - prev.begin)
+                    value = prev.start_value + \
+                        (prev.end_value - prev.start_value) * frac
             target = Fraction(it.target)
+            interrupted_by = None
             if it.duration == 0:
                 segs.append(Segment(s, s, target, target, True, it.id))
                 value = target
-                interrupted_by = None
             else:
                 segs.append(Segment(s, e, value, target, False, it.id))
                 value = target
-                nxt = next((j for j in lane_items if starts[j] > s), None)
-                interrupted_by = nxt.id if nxt is not None and starts[nxt] < e else None
+                # lane_items is start-sorted; the next item is the next
+                # element (same-instant starts on this lane cannot exist)
+                nxt = lane_items[k + 1] if k + 1 < len(lane_items) else None
+                if nxt is not None and starts[nxt] < e:
+                    interrupted_by = nxt.id
             resolved[it.id] = ResolvedItem(it, s, e, interrupted_by)
         lanes[f"{fixture}|{channel}"] = segs
 
     out = [resolved[it.id] for it in items]  # reference/input order
     return ResolvedView(items=out, lanes=lanes)
-
-
-def _value_at(segs: List[Segment], t: int, fallback: Fraction) -> Fraction:
-    for seg in reversed(segs):
-        if seg.instant:
-            if t >= seg.begin:
-                return seg.end_value
-            continue
-        if t >= seg.end:
-            return seg.end_value
-        if t >= seg.begin:
-            if seg.end == seg.begin:
-                return seg.end_value
-            frac = Fraction(t - seg.begin, seg.end - seg.begin)
-            return seg.start_value + (seg.end_value - seg.start_value) * frac
-    return fallback
 
 
 # An evaluation instant.  Item starts/durations stay integer milliseconds,
@@ -330,21 +403,11 @@ def port_fragment(
     shift = landing_ms - earliest  # every actual start moves by this delta
 
     # ancestors first, so a reference is always rewired to an ancestor
-    # whose new id is already allocated; deterministic for a given source
-    order: List[int] = []
-    seen = set()
-
-    def visit(i: int) -> None:
-        if i in seen:
-            return
-        seen.add(i)
-        it = by_id[i]
-        if it.start_mode == "ref" and it.ref_id in closure:
-            visit(it.ref_id)
-        order.append(i)
-
-    for i in sorted(closure):
-        visit(i)
+    # whose new id is already allocated; deterministic for a given source.
+    # This is the same iterative dependency order that resolved the starts
+    # above, so long legal chains (including earlier -> later ids) port
+    # without recursion.
+    order = dependency_order(sorted(closure), by_id)
 
     plan: List[Tuple[int, Item]] = []
     for old_id in order:

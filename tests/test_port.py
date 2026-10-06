@@ -36,6 +36,11 @@ class PortTest(unittest.TestCase):
     def setUpClass(cls):
         db.init_db()
         cls.client = TestClient(app)
+        cls.client.__enter__()  # reuse one portal/event loop for every request
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
 
     def setUp(self):
         self.src = self.client.post("/api/projects", json={"name": "src"}).json()["id"]
@@ -264,6 +269,91 @@ class PortTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("同时起步", r.json()["detail"])
         self.assert_unchanged(before_src, before_dst)
+
+    def test_port_deep_chain_rewires_in_order_and_conflict_rolls_back(self):
+        # a ~500-level legal chain ALREADY IN THE LIBRARY (earlier ids depend
+        # on the LATER item's end) must plan ancestor-first writes, rewire
+        # every reference and evaluate in the target; a later conflict must
+        # roll the whole batch back.  The source chain is built directly in
+        # SQLite (its save path is covered by test_api); the port goes over
+        # HTTP so rewire / merge-validation / rollback are exercised end to
+        # end.
+        from app.engine import Item as EngineItem
+
+        n = 520
+
+        def ch(i):
+            return ((i - 1) % 8) + 1
+
+        with db.transaction() as conn:
+            order = db.next_sort_order(conn, self.src)
+            ids = []
+            for i in range(1, n + 1):
+                channel = 512 if i == 1 else ch(i)
+                it = EngineItem(None, "L1", channel, 100, 10, "abs",
+                                start_ms=i * 100)
+                ids.append(db.insert_item(conn, self.src, it, order))
+                order += 1
+            for i in range(1, n):
+                db.update_item(conn, self.src, EngineItem(
+                    ids[i - 1], "L1", 512 if i == 1 else ch(i), 100, 10,
+                    "ref", ref_id=ids[i], ref_edge="end", ref_offset=1))
+
+        before_src = self.get(self.src_url)
+        before_dst = self.get(self.dst_url)
+        r = self.port([ids[0]], 10000)
+        self.assertEqual(r.status_code, 201, r.text)
+        payload = r.json()
+        id_map = {int(k): v for k, v in payload["port"]["id_map"].items()}
+        self.assertEqual(sorted(id_map), sorted(ids))
+        items = {i["id"]: i for i in payload["items"]}
+        # ancestor-first allocation: later source ids get earlier new ids,
+        # so every ref points at an ancestor allocated before the dependent
+        for i in range(1, n):
+            self.assertLess(id_map[ids[i]], id_map[ids[i - 1]])
+            dep = items[id_map[ids[i - 1]]]
+            self.assertEqual(dep["ref_id"], id_map[ids[i]])
+            self.assertEqual(dep["ref_edge"], "end")
+            self.assertEqual(dep["ref_offset"], 1)
+        head_id, anchor_id = id_map[ids[0]], id_map[ids[-1]]
+        self.assertEqual(items[anchor_id]["start_mode"], "abs")
+        self.assertEqual(items[anchor_id]["actual_start"], 10000)
+        self.assertEqual(items[head_id]["actual_start"],
+                         10000 + (n - 1) * 11)
+        # evaluates in the target on the head item's own channel
+        ev = self.client.get(f"{self.dst_url}/eval",
+                             params={"t": items[head_id]["actual_start"] + 5})
+        ch512 = next(c for c in ev.json()["channels"] if c["channel"] == 512)
+        self.assertEqual(ch512["raw"], "50")
+        self.assertEqual(ch512["active_item_id"], head_id)
+        # source untouched
+        self.assertEqual(self.get(self.src_url), before_src)
+
+        # porting into another target whose lane already starts where the
+        # head would land rolls the WHOLE batch back: every project returns
+        # to its prior state
+        third = self.client.post("/api/projects",
+                                 json={"name": "third"}).json()["id"]
+        self.add(third, abs_body(fixture="L1", channel=512,
+                                 ms=10000 + (n - 1) * 11, duration=10))
+        before_third = self.get(f"/api/projects/{third}")
+        r2 = self.client.post(
+            f"{self.src_url}/port",
+            json={"target_project_id": third,
+                  "item_ids": [ids[0]], "landing_ms": 10000})
+        self.assertEqual(r2.status_code, 400)
+        self.assertIn("同时起步", r2.json()["detail"])
+        self.assertEqual(self.get(self.src_url), before_src)
+        # the first port's target is detail-identical (strip the port-only
+        # envelope keys from its response)
+        def detail_of(p):
+            return {k: v for k, v in p.items()
+                    if k not in ("focus_item_id", "port")}
+        self.assertEqual(self.get(self.dst_url), detail_of(payload))
+        # third project keeps only its original clash item
+        self.assertEqual(self.get(f"/api/projects/{third}"), before_third)
+        self.assertEqual(before_dst, {"items": [], "id": self.dst,
+                                      "name": "dst", "duration": 0})
 
     def test_existing_single_item_endpoints_still_behave(self):
         # a port followed by ordinary edits keeps the old behaviour
